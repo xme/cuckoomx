@@ -1,0 +1,37 @@
+CuckooMX is a project to automate analysis of files transmitted over SMTP (using the Cuckoo sandbox) 
+Copyright (C) 2012 Xavier Mertens <xavier(at)rootshell(dot)be>
+
+More information is available here: http://blog.rootshell.be/2012/06/20/cuckoomx-autom…ng-with-cuckoo/
+
+History
+-------
+2012/06/20	First release
+
+Installation
+------------
+
+Requirement:
+- A running instance of Postfix
+- A running install of Cuckoo
+
+1. Copy cuckoomx.pl in your prefered directory.
+2. Edit the configuration file path (line 58).
+3. Copy the sample configuration file in the right directory and change it to match your environment.
+4. Edit your Postfix master.cf file:
+
+	- Change the smtp service:
+
+		# ==========================================================================
+		# service type  private unpriv  chroot  wakeup  maxproc command + args
+		#               (yes)   (yes)   (yes)   (never) (100)
+		# ==========================================================================
+		smtp      inet  n       -       -       -       -       smtpd
+		        -o content_filter=cuckoomx
+
+	- Create a new service (bottom of the file)
+
+		cuckoomx  unix  -       n       n       -       -       pipe
+		        user=cuckoo argv=/data/cuckoo/cuckoomx.pl -f ${sender} ${recipient}
+
+	- Restart Postfix
+
