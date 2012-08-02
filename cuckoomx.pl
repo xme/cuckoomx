@@ -32,15 +32,20 @@
 # History
 # -------
 # 2012/06/20	First release
+# 2012/07/03	Added processing of URLs inside the body
+# 2012/07/04	Added libmagic support for better detection of files
 #
 
 use Archive::Extract;
 # use Archive::Rar;
 use DBI;
 use Digest::MD5;
+use File::LibMagic;
 use File::Path qw(make_path remove_tree);
+use File::Temp;
 use MIME::Parser;
 use Sys::Syslog;
+use URI::Find;
 use XML::XPath;
 use XML::XPath::XMLParser;
 use strict;
@@ -65,11 +70,14 @@ my $outputDir		= "/data/cuckoo/quarantine"; # Temporary directory based on our P
 my $notifyEmail		= "xavier\@example.com";
 my $processZip		= 1;
 my $processRar		= 1;
+my $processUrl		= 0;
 
 # Define the file types to ignore
 # By default, we don't care about plain text, HTML files and images.
 my @suspiciousFiles;
-my @ignoreTypes;
+my @suspiciousURLs;
+my @ignoreMimes;
+my @ignoreURLs;
 
 # Read running parameters
 if (!readConfigFile($configFile)) {
@@ -117,9 +125,14 @@ chomp($from);
 chomp($subject);
 
 syslogOutput("Processing mail from: $from ($subject)");
-# Recursively process the MIME entities
+
+# Step 1 : Extract URLs from content (optional)
+($processUrl) && processURLs("$outputDir/content.tmp");
+
+# Step 2 : Recursively process the MIME entities
 processMIMEParts($entity);
-if (! @suspiciousFiles) {
+
+if (! @suspiciousFiles && ! @suspiciousURLs) {
 	# No MIME data extracted, send the (safe) mail immediately
 	deliverMail();
 	# We can safely remove the mail from the quarantine
@@ -127,8 +140,6 @@ if (! @suspiciousFiles) {
 	exit 0;
 } 
 else {
-	syslogOutput("Files to process: " . @suspiciousFiles);
-		
 	# Connect to the Cuckoo DB
 	my $dbh = DBI->connect("dbi:SQLite:dbname=$cuckooDB");
 	if (!$dbh) {
@@ -136,41 +147,67 @@ else {
 		exit EX_TEMPFAIL;
 	}
 
-	for my $file (@suspiciousFiles) {
-		# Compute MD5 hash
-		if (!open(FILE, "$file")) {
-			syslogOutput("Open \"$file\" failed: $!");
-			exit EX_TEMPFAIL;
-		}
-		binmode(FILE);
-		my $md5Digest = Digest::MD5->new->addfile(*FILE)->hexdigest;
-		close(FILE);
-		
-		# Search for existing MD5 in the Cuckoo DB
-		# to skip already submitted files
-		my $row = $dbh->selectrow_arrayref("SELECT md5 FROM queue where md5=\"$md5Digest\"");
-	
-		if (!$row) {
-			# MD5 not found, process the new file!
-			$dbh->do("INSERT INTO queue \
-				(target, md5, timeout, package, priority, custom, vm_id) \
-				VALUES (\"$file\", \"$md5Digest\", NULL, NULL, NULL, \
-				NULL, \"$cuckooVM\")");
-			if ($DBI::errstr) {
-				syslogOutput("Cannot submit file: " . $DBI::errstr);
-				exit EX_TEMPFAIL;
-			}
-		}
-		else {
-			syslogOutput("\"$file\" already scanned (MD5: $md5Digest)");
+	# Submit suspicious files to Cuckoo
+	syslogOutput("Files to process: " . @suspiciousFiles);
+	for my $f (@suspiciousFiles) {
+		submitFile($f, $dbh);
+	}
+
+	# Submit suspicious URLs to Cuckoo (optional)
+	if ($processUrl) {
+		syslogOutput("URLs to process: " . @suspiciousURLs);	
+		foreach my $u (@suspiciousURLs) {
+			submitURL($u, $dbh);
 		}
 	}
+
 	$dbh->disconnect;
+
 	# Now, mail is always delivered
 	# Todo: Quarantine system + notify admin
 	deliverMail();
 }
 exit 0;
+
+#
+# getPackage	Use File::LigMagic to guess the file type
+#		and return the right analysis package
+#
+# Input:	$f - Path of file to analyze
+# Output:	Package name or empty string if not supported
+#
+sub getPackage {
+	my $f = shift || return("");
+	my $flm = File::LibMagic->new();
+	my $b = $flm->describe_filename("$f");
+	if ( $b =~ /Microsoft [Office ]*PowerPoint/i ) {
+		return("ppt");
+	}
+	elsif ( $b =~ /Microsoft [Office ]*Excel/i ) {
+		return("xls");
+	}
+	elsif ($b =~ /Microsoft [Office ]*Word/i ||
+	    $b =~ /Composite Document File V\d Document/i	 ||
+	    $b =~ /Rich Text Format/i) {
+		return("doc");
+	}
+	elsif ( $b =~ /PDF Document/i) {
+		return("pdf");
+	}
+	elsif ( $b =~ /HTML document/i) {
+		return("firefox");
+	}
+	elsif ( $b =~ /PHP script/i) {
+		return("php");
+	}
+	elsif ( $b =~ /diff output/i) {
+		return("");
+	}
+	else {
+		# Default package
+		return("exe");
+	}
+}
 
 #
 # processMIMEParts
@@ -184,6 +221,7 @@ sub processMIMEParts
 		   $part->mime_type eq 'multipart/related' ||
 		   $part->mime_type eq 'multipart/mixed' ||
 		   $part->mime_type eq 'multipart/signed' ||
+		   $part->mime_type eq 'multipart/report' ||
 		   $part->mime_type eq 'message/rfc822' ) {
 			# Recursively process the message
 			processMIMEParts($part);
@@ -193,7 +231,7 @@ sub processMIMEParts
 			my $bh = $part->bodyhandle;
 			syslogOutput("Dumped: \"" . $bh->{MB_Path} . "\" (" . $type . ")");
 			# Ignore our trusted MIME-types
-			if (!grep {$_ eq $type} @ignoreTypes) {
+			if (!grep {$_ eq $type} @ignoreMimes) {
 				# Uncompress ZIP archives
 				if ($type eq "application/zip" && $processZip) { 
 					my $ae = Archive::Extract->new( archive => $bh->{MB_Path});
@@ -219,6 +257,133 @@ sub processMIMEParts
 		}
 	}
 	return;
+}
+
+#
+# processURLs
+#
+sub processURLs {
+	my $content = shift || return;
+	syslogOutput("DEBUG: processURLs($content)");
+	my $buffer;
+	if (! open(IN, "<$content")) {
+		syslogOutput("processURLs: Cannot read $content: $!");
+		exit EX_UNAVAILABLE;
+	}
+	while(<IN>) { $buffer = $buffer . $_; }
+	close(IN);
+
+	# Reformat text 
+	$buffer =~ s/=\n//g;    # Remove trailing "="
+
+	my $finder = URI::Find->new(
+			sub {
+				my $u = shift;
+				my $matchExclude = 0;
+				if ($u =~ /^http[s]*:\/\//) { # Process only HTTP(S) URI
+					if (!($u =~ /\.(jpg|jpeg|png|gif)$/i)) { # Ignore common pictures & files
+						foreach my $iu (@ignoreURLs) {
+							($u =~ /$iu/i) && $matchExclude++;
+						}
+						if (!$matchExclude && 
+						    !(grep /$u/, @suspiciousURLs)) {
+							# URLs not excluded and not already found -> save it
+							push(@suspiciousURLs, $u);
+						}
+						#else {
+						#	syslogOutput("DEBUG: Exclude: $u");
+						#}
+					}
+				}
+				#else {
+				#	syslogOutput("DEBUG: Ignoring URI: $u");
+				#}
+			}
+		     );
+	$finder->find(\$buffer);
+	return; 
+}
+
+#
+# submitFile
+#
+sub submitFile {
+	my $file = shift || return;
+	my $dbh  = shift || return;
+
+	# Compute MD5 hash
+	if (!open(FILE, "$file")) {
+		syslogOutput("Open \"$file\" failed: $!");
+		exit EX_TEMPFAIL;
+	}
+	binmode(FILE);
+	my $md5Digest = Digest::MD5->new->addfile(*FILE)->hexdigest;
+	close(FILE);
+
+	# Search for existing MD5 in the Cuckoo DB
+	# to skip already submitted files
+	my $row = $dbh->selectrow_arrayref("SELECT md5 FROM tasks where md5=\"$md5Digest\"");
+
+	if (!$row) { # MD5 not found, process the new file!
+		# Try to detect the file type to use the right analysis package
+		my $package = getPackage($file);
+		if ($package) { # Got a valid package, submit the file
+			$dbh->do("INSERT INTO tasks \
+				(file_path, md5, timeout, package, priority, custom, machine) \
+				VALUES (\"$file\", \"$md5Digest\", NULL, \"$package\", NULL, \
+				NULL, \"$cuckooVM\")");
+			if ($DBI::errstr) {
+				syslogOutput("Cannot submit file: " . $DBI::errstr);
+				exit EX_TEMPFAIL;
+			}
+		}
+	}
+	else {
+		syslogOutput("\"$file\" already scanned (MD5: $md5Digest)");
+	}
+}
+
+#
+# submitURL
+#
+sub submitURL {
+	my $url = shift || return;
+	my $dbh = shift || return;
+
+	my $buffer = "[InternetShortcut]\r\nURL=$url\r\n";
+	# Generate the MD5 hash and search the database to avoid
+	# duplicate URLs
+	my $md5Digest  = Digest::MD5->new->add($buffer)->hexdigest;
+	my $row = $dbh->selectrow_arrayref("SELECT md5 FROM tasks where md5=\"$md5Digest\"");
+	if (!$row) { # MD5 not found, submit the URL
+		$url =~ /http[s]*:\/\/((\w|\.)+)/;
+		my $prefix = $1;
+		$prefix =~ tr/\./\-/;
+		my $tmpFile = File::Temp->new( TEMPLATE => $prefix .'_XXXXXXXXXXXXXXXX',
+					       DIR => "$outputDir",
+					       SUFFIX => '.url',
+					       UNLINK => '0' );
+		syslogOutput("DEBUG: Creating tempfile $tmpFile");
+		if (!open(TF, ">$tmpFile")) {
+			syslogOutput("Cannot create file $tmpFile: $!");
+			exit EX_TEMPFAIL;
+		}
+		print TF $buffer;
+		close(TF);
+
+		syslogOutput("DEBUG: Submit URL: \"$url\"");
+		#$dbh->do("INSERT INTO tasks \
+		#	(file_path, md5, timeout, package, priority, custom, machine) \
+		#	VALUES (\"$tmpFile\", \"$md5Digest\", NULL, \"firefox\", NULL, \
+		#	NULL, \"$cuckooVM\")");
+		if ($DBI::errstr) {
+			syslogOutput("Cannot submit URL: " . $DBI::errstr);
+			exit EX_TEMPFAIL;
+		}
+	}
+	else {
+		syslogOutput("\"$url\" already submitted (MD5: $md5Digest)");
+	}
 }
 
 #
@@ -277,6 +442,8 @@ sub readConfigFile {
 		(lc($buff) eq "yes" || $buff eq "1") && $processZip++;
 		$buff           = $node->find('process-rar')->string_value;
 		(lc($buff) eq "yes" || $buff eq "1") && $processRar++;
+		$buff           = $node->find('process-url')->string_value;
+		(lc($buff) eq "yes" || $buff eq "1") && $processUrl++;
 		$outputDir	= $node->find('outputdir')->string_value;
 	}
 
@@ -297,11 +464,17 @@ sub readConfigFile {
 	}
 
 	# Ignore MIME-types
-	$nodes = $xml->find('/cuckoomx/ignore/mime-type/text()');
+	$nodes = $xml->find('/cuckoomx/ignore-mime/mime-type/text()');
 	foreach my $node ($nodes->get_nodelist) {
 		$buff = $node->string_value;
-		push(@ignoreTypes, $buff);
+		push(@ignoreMimes, $buff);
+	}
+
+	# Ignore URLs
+	$nodes = $xml->find('/cuckoomx/ignore-url/url/text()');
+	foreach my $url ($nodes->get_nodelist) {
+		$buff = $url->string_value;
+		push(@ignoreURLs, $buff);
 	}
 	return 1;
 }
-

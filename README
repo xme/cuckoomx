@@ -6,6 +6,7 @@ More information is available here: http://blog.rootshell.be/2012/06/20/cuckoomx
 History
 -------
 2012/06/20	First release
+2012/08/02	Improved code - fixed support for Cuckoo 0.4, processing URLs
 
 Installation
 ------------
